@@ -1,36 +1,46 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.18;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Lockdrop.sol";
 import "./IUniswapV2Pair.sol";
+import "./UserAllocation.sol";
 
 contract Airdrop is Ownable {
+
+    uint256 public constant LP_Multiplier_DIVIDER = 1000000;
+
     IERC20 public token;
     LockdropPhase1 public lockdropPhase1;
     address public pairAddress;
     bytes32 public merkleRoot;
     mapping(address => uint256) public claimedAmounts;
-    mapping(address => uint256) private totalEntitlements;
+    mapping(address => uint256) private totalUserAirdrop;
 
     uint256 public firstAirdropDate;
-    uint256 public secondAirdropDate;
-    uint256 public thirdAirdropDate;
-    uint256 public finalAirdropDate;
+    uint256 public lockdropAirdropReleaseDate;
+
+    uint256 public vestingStartDate;
+    uint256 public vestingEndDate;
+    uint256 public vestingDuration;
+
+    uint256 public lpMultiplier;
+
 
     event NewMerkleRoot(address user, bytes32 merkleRoot);
-    event NewLockdrop(address user, address lockdropAddress);
-    event NewPairAddress(address user, address pairAddress);
+    event NewMultiplier(address user, uint256 lpMultiplier);
+    event NewLockdropAndPairAddress(address user, address lockdropAddress, address pairAddress);
 
-    constructor(address _token, bytes32 _merkleRoot, uint256 _firstAirdropDate, uint256 _secondAirdropDate, uint256 _thirdAirdropDate, uint256 _finalAirdropDate) {
+    constructor(address _token, bytes32 _merkleRoot, uint256 _firstAirdropDate, uint256 _lockdropAirdropReleaseDate, uint256 _vestingStartDate, uint256 _vestingEndDate) {
         token = IERC20(_token);
         merkleRoot = _merkleRoot;
         firstAirdropDate = _firstAirdropDate;
-        secondAirdropDate = _secondAirdropDate;
-        thirdAirdropDate = _thirdAirdropDate;
-        finalAirdropDate = _finalAirdropDate;
+        lockdropAirdropReleaseDate = _lockdropAirdropReleaseDate;
+        vestingStartDate = _vestingStartDate;
+        vestingEndDate = _vestingEndDate;
+        vestingDuration = _vestingEndDate - _vestingStartDate;
     }
 
     function setMerkleRoot(bytes32 _merkleRoot) external onlyOwner {
@@ -38,14 +48,15 @@ contract Airdrop is Ownable {
         emit NewMerkleRoot(msg.sender, _merkleRoot);
     }
 
-    function setLockdropAddress(address _lockdropAddress) external onlyOwner {
-        lockdropPhase1 = LockdropPhase1(_lockdropAddress);
-        emit NewLockdrop(msg.sender, _lockdropAddress);
+    function setLpMultiplier(uint256 _lpMultiplier) external onlyOwner {
+        lpMultiplier = _lpMultiplier;
+        emit NewMultiplier(msg.sender, _lpMultiplier);
     }
 
-    function setPairAddress(address _pairAddress) external onlyOwner {
+    function setLockdropAddressAndPairAddress(address _lockdropAddress, address _pairAddress) external onlyOwner {
+        lockdropPhase1 = LockdropPhase1(_lockdropAddress);
         pairAddress = _pairAddress;
-        emit NewPairAddress(msg.sender, _pairAddress);
+        emit NewLockdropAndPairAddress(msg.sender, _lockdropAddress, _pairAddress);
     }
 
     function claim(uint256 airdropAmount, bytes32[] calldata merkleProof) public {
@@ -59,33 +70,37 @@ contract Airdrop is Ownable {
         );
         require(isValidProof, 'Invalid merkle proof.');
 
-        totalEntitlements[msg.sender] = airdropAmount;
-        uint256 claimableAmount = getClaimableAmount(msg.sender);
+        totalUserAirdrop[msg.sender] = airdropAmount;
+        uint256 claimableAmount = getClaimableAmount(msg.sender, totalUserAirdrop[msg.sender]);
 
         require(claimableAmount > 0, "No claimable amount.");
         claimedAmounts[msg.sender] += claimableAmount;
         require(token.transfer(msg.sender, claimableAmount), "Airdrop transfer failed.");
     }
 
-    function getClaimableAmount(address _address) public view returns (uint256) {
-        uint256 totalEntitled = totalEntitlements[_address];
+    function getClaimableAmount(address _address, uint256 _totalAirdrop) public view returns (uint256) {
+        uint256 totalEntitled = _totalAirdrop;
         uint256 alreadyClaimed = claimedAmounts[_address];
-        uint256 lockdropBonus = getGSTokenLocked(_address);
+        uint256 halfOfAirdrop = totalEntitled / 2;
 
         uint256 claimable = 0;
-        if (block.timestamp < firstAirdropDate) {
-            return claimable;
-        } else if (block.timestamp < secondAirdropDate) {
-            claimable = totalEntitled * 50 / 100;
-        } else if (block.timestamp < thirdAirdropDate) {
-            claimable = totalEntitled * 665 / 1000;
-        } else if (block.timestamp < finalAirdropDate) {
-            claimable = totalEntitled * 83 / 100;
-        } else {
-            claimable = totalEntitled;
+
+        if (block.timestamp > vestingStartDate) {
+            claimable += getVestedAmount(halfOfAirdrop);
         }
 
-        claimable += lockdropBonus;
+        if (block.timestamp > lockdropAirdropReleaseDate && lpMultiplier > 0) {
+            uint256 userLpLock = getLock(_address);
+            uint256 amountReq = halfOfAirdrop * lpMultiplier / LP_Multiplier_DIVIDER;
+
+            if (userLpLock >= amountReq) {
+                claimable += halfOfAirdrop;
+            }
+        }
+
+        if (block.timestamp > firstAirdropDate) {
+            claimable += halfOfAirdrop;
+        }
 
         if (claimable > totalEntitled) {
             claimable = totalEntitled;
@@ -94,40 +109,31 @@ contract Airdrop is Ownable {
         return claimable > alreadyClaimed ? claimable - alreadyClaimed : 0;
     }
 
-    function isGsTokenReserve0(address _pairAddress) internal view returns (bool) {
-        IUniswapV2Pair pair = IUniswapV2Pair(_pairAddress);
-        return pair.token0() == address(token);
-    }
-
-    function getTokenNumberFromLp(address _pairAddress, uint lpAmount) internal view returns (uint tokenAmount) {
-        IUniswapV2Pair pair = IUniswapV2Pair(_pairAddress);
-        uint totalLpTokens = pair.totalSupply();
-        (uint reserve0, uint reserve1,) = pair.getReserves();
-
-        if (isGsTokenReserve0(_pairAddress)) {
-            return lpAmount * reserve0 * 2 / totalLpTokens;
+    function getVestedAmount(uint256 amountToVest) internal view returns (uint256) {
+        if (block.timestamp < vestingStartDate) {
+            return 0;
+        } else if (block.timestamp >= vestingEndDate) {
+            return amountToVest;
+        } else {
+            uint256 elapsedTime = block.timestamp - vestingStartDate;
+            return amountToVest * elapsedTime / vestingDuration;
         }
-        return lpAmount * reserve1 * 2 / totalLpTokens;
     }
 
-    function getLock(address checkedAddress) internal view returns (uint tokenAmount) {
-        uint256 allocationsCount = lockdropPhase1.userAllocationsCount(checkedAddress);
-        uint256 lockedTokens;
-        for (uint i = 1; i <= allocationsCount; i++) {
-            (bool taken,IUniswapV2Pair pairToken,,uint256 value,,) = lockdropPhase1.userAllocations(checkedAddress, i);
-
-            if (address(pairToken) == pairAddress && !taken) {
-                lockedTokens += value;
-            }
-        }
-        return lockedTokens;
-    }
-
-    function getGSTokenLocked(address checkedAddress) public view returns (uint tokenAmount){
+    function getLock(address checkedAddress) public view returns (uint tokenAmount) {
         if (address(lockdropPhase1) == address(0) || pairAddress == address(0)) {
             return 0;
         }
-        uint256 lockedLp = getLock(checkedAddress);
-        return getTokenNumberFromLp(pairAddress, lockedLp);
+
+        uint256 lockedTokens;
+        UserAllocation[] memory allocations = lockdropPhase1.getUserAllocations(checkedAddress);
+
+        for (uint i = 0; i < allocations.length; i++) {
+            if (address(allocations[i].token) == pairAddress && !allocations[i].taken) {
+                lockedTokens += allocations[i].value;
+            }
+        }
+
+        return lockedTokens;
     }
 }
