@@ -66,6 +66,7 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
         require(_endTime > _startTime, "End time must be greater than start time");
         require(_tokenAddress != address(0), "Token address cannot be zero address");
 
+        config.tgeDate = _tgeDate;
         config.startDate = _startTime;
         config.endDate = _endTime;
         config.token = IERC20(_tokenAddress);
