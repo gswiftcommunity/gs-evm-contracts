@@ -26,7 +26,7 @@ contract FixedStaking is Ownable, ReentrancyGuard {
     uint256 public constant RATE_DIVIDER = 100_000;
     uint256 public constant YEAR_DIVIDER = 31556952;
 
-    IERC20 public token;
+    IERC20 immutable public token;
     RewardPeriod[] public rewardPeriods;
     mapping(address => UserInfo) public userInfo;
     uint256 public totalStaked;
@@ -42,14 +42,14 @@ contract FixedStaking is Ownable, ReentrancyGuard {
     event UnbondTimeUpdated(uint256 daysNumber);
     event Withdraw(address user, uint256 amount);
     event WithdrawEth(address user, uint256 amount);
-    event UpdateFee(uint256 newFee);
+    event UpdateFee(uint256 newFee, uint256 oldFee);
 
     error TransferFailed();
     error WithdrawFailed();
 
     modifier checkEthFeeAndRefundDust(uint256 value) {
         require(value >= ethFee, "Insufficient fee: the required fee must be covered");
-        uint256 dust = value - ethFee;
+        uint256 dust = unsafeSub(value, ethFee);
         (bool sent,) = address(msg.sender).call{value : dust}("");
         require(sent, "Failed to return overpayment");
         _;
@@ -63,14 +63,14 @@ contract FixedStaking is Ownable, ReentrancyGuard {
 
     function stake(uint256 _amount) external nonReentrant {
         require(token.transferFrom(msg.sender, address(this), _amount), "Stake transfer failed.");
+        require(block.timestamp >= rewardPeriods[0].start, "Staking not stared.");
 
         totalStaked += _amount;
         UserInfo storage user = userInfo[msg.sender];
         if (user.amount != 0) {
             uint256 pending = calculateReward(msg.sender);
-            if (pending > 0) {
+            if (pending != 0) {
                 user.waitingRewards += pending;
-                user.lastStakeTime = block.timestamp;
             }
         }
         user.amount += _amount;
@@ -86,17 +86,18 @@ contract FixedStaking is Ownable, ReentrancyGuard {
     }
 
 
-    function startUnstaking(uint256 _amount) external payable checkEthFeeAndRefundDust(msg.value) nonReentrant {
+    function startUnstaking(uint256 _amount) external payable nonReentrant checkEthFeeAndRefundDust(msg.value) {
         UserInfo storage user = userInfo[msg.sender];
+        require(_amount > 0, "Zero amount");
         require(user.unbondings.length < unbondLimit, "startUnstaking: limit reached");
         require(user.amount >= _amount, "startUnstaking: not enough staked amount");
         totalStaked -= _amount;
         uint256 pending = calculateReward(msg.sender);
-        if (pending > 0) {
+        if (pending != 0) {
             user.waitingRewards += pending;
             user.lastStakeTime = block.timestamp;
         }
-        user.amount -= _amount;
+        user.amount = unsafeSub(user.amount, _amount);
 
         UnbondInfo memory newUnbond = UnbondInfo({
         amount : _amount,
@@ -107,11 +108,11 @@ contract FixedStaking is Ownable, ReentrancyGuard {
         emit UnstakeStarted(msg.sender, _amount);
     }
 
-    function finishUnstaking() external payable checkEthFeeAndRefundDust(msg.value) nonReentrant {
+    function finishUnstaking() external payable nonReentrant checkEthFeeAndRefundDust(msg.value) {
         UserInfo storage user = userInfo[msg.sender];
         uint256 releasedAmount;
 
-        uint256 i = 0;
+        uint256 i;
         while (i < user.unbondings.length) {
             UnbondInfo storage unbonding = user.unbondings[i];
             if (unbonding.release <= block.timestamp) {
@@ -121,19 +122,19 @@ contract FixedStaking is Ownable, ReentrancyGuard {
                 }
                 user.unbondings.pop();
             } else {
-                i++;
+                i = unsafeInc(i);
             }
         }
 
-        require(releasedAmount > 0, "Nothing to release");
+        require(releasedAmount != 0, "Nothing to release");
         require(token.transfer(msg.sender, releasedAmount), "Finish unstaking transfer failed.");
         emit UnstakeFinished(msg.sender, releasedAmount);
     }
 
-    function claim() external payable checkEthFeeAndRefundDust(msg.value) nonReentrant {
+    function claim() external payable nonReentrant checkEthFeeAndRefundDust(msg.value) {
         UserInfo storage user = userInfo[msg.sender];
         uint256 pending = calculateReward(msg.sender) + user.waitingRewards;
-        require(pending > 0, "claim: nothing to claim");
+        require(pending != 0, "claim: nothing to claim");
         user.waitingRewards = 0;
         user.lastStakeTime = block.timestamp;
         require(token.transfer(msg.sender, pending), "Claim transfer failed.");
@@ -143,7 +144,7 @@ contract FixedStaking is Ownable, ReentrancyGuard {
     function restake() external nonReentrant {
         UserInfo storage user = userInfo[msg.sender];
         uint256 pending = calculateReward(msg.sender) + user.waitingRewards;
-        require(pending > 0, "restake: nothing to restake");
+        require(pending != 0, "restake: nothing to restake");
         user.waitingRewards = 0;
         user.amount += pending;
         totalStaked += pending;
@@ -156,22 +157,21 @@ contract FixedStaking is Ownable, ReentrancyGuard {
         if (user.lastStakeTime == 0) {
             return 0;
         }
-        uint256 reward = 0;
+        uint256 reward;
         uint256 startIndex = 0;
-        for (uint256 i = 0; i < rewardPeriods.length; i++) {
+        for (uint256 i = 0; i < rewardPeriods.length; i = unsafeInc(i)) {
             if (rewardPeriods[i].start < user.lastStakeTime) {
                 startIndex = i;
             }
         }
 
-        for (uint256 i = startIndex; i < rewardPeriods.length; i++) {
+        for (uint256 i = startIndex; i < rewardPeriods.length; i = unsafeInc(i)) {
             uint256 timeDelta;
+            uint256 tempStart = rewardPeriods[i].start < user.lastStakeTime ? user.lastStakeTime : rewardPeriods[i].start;
             if (i < rewardPeriods.length - 1) {
-                uint256 tempStart = rewardPeriods[i].start < user.lastStakeTime ? user.lastStakeTime : rewardPeriods[i].start;
                 timeDelta = rewardPeriods[i + 1].start - tempStart;
                 reward += user.amount * rewardPeriods[i].rate * timeDelta / YEAR_DIVIDER / RATE_DIVIDER;
             } else {
-                uint256 tempStart = rewardPeriods[i].start < user.lastStakeTime ? user.lastStakeTime : rewardPeriods[i].start;
                 timeDelta = block.timestamp - tempStart;
                 reward += user.amount * rewardPeriods[i].rate * timeDelta / YEAR_DIVIDER / RATE_DIVIDER;
             }
@@ -189,7 +189,7 @@ contract FixedStaking is Ownable, ReentrancyGuard {
         uint256[] memory amounts = new uint256[](unbondings.length);
         uint256[] memory releases = new uint256[](unbondings.length);
 
-        for (uint i = 0; i < unbondings.length; i++) {
+        for (uint i; i < unbondings.length; i = unsafeInc(i)) {
             amounts[i] = unbondings[i].amount;
             releases[i] = unbondings[i].release;
         }
@@ -210,26 +210,34 @@ contract FixedStaking is Ownable, ReentrancyGuard {
     function withdrawToken(IERC20 _token, uint256 amount) external onlyOwner {
 
         if (
-            !_token.transfer(owner(), amount)
+            !_token.transfer(msg.sender, amount)
         ) {
             revert TransferFailed();
         }
 
-        emit Withdraw(owner(), amount);
+        emit Withdraw(msg.sender, amount);
     }
 
     function withdrawEth(uint256 amount) external onlyOwner {
-
-        (bool success,) = payable(owner()).call{value : amount}("");
+        require(address(this).balance >= amount, "Insufficient balance");
+        (bool success,) = payable(msg.sender).call{value : amount}("");
         if (!success) {
             revert WithdrawFailed();
         }
-        emit WithdrawEth(owner(), amount);
+        emit WithdrawEth(msg.sender, amount);
     }
 
     function updateEthFee(uint256 _newFee) external onlyOwner {
-
+        uint256 oldFee = ethFee;
         ethFee = _newFee;
-        emit UpdateFee(_newFee);
+        emit UpdateFee(_newFee, oldFee);
+    }
+
+    function unsafeInc(uint x) private pure returns (uint) {
+    unchecked {return x + 1;}
+    }
+
+    function unsafeSub(uint x, uint y) private pure returns (uint) {
+    unchecked {return x - y;}
     }
 }

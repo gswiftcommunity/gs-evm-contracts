@@ -2,12 +2,10 @@
 pragma solidity ^0.8.18;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 contract FixedVestingCliff is Ownable, ReentrancyGuard {
-    using SafeMath for uint256;
     uint256 public constant VESTING_DIVIDER = 100000;
     uint256 public constant YEAR_DIVIDER = 31556952;
 
@@ -34,18 +32,20 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
     event TokensReleased(uint256 amount, address user);
     event Withdraw(address user, uint256 amount);
     event WithdrawEth(address user, uint256 amount);
-    event UpdateFee(uint256 newFee);
+    event UpdateFee(uint256 newFee, uint256 oldFee);
     event StakingRewardClaimed(address indexed user, uint256 amount);
-    event FreezeAccount(address indexed user);
+    event FreezeAccount(address indexed user, bool freeze);
 
     error TransferFailed();
     error WithdrawFailed();
 
     modifier checkEthFeeAndRefundDust(uint256 value) {
         require(value >= config.ethFee, "Insufficient fee: the required fee must be covered");
-        uint256 dust = value - config.ethFee;
-        (bool sent,) = address(msg.sender).call{value : dust}("");
-        require(sent, "Failed to return overpayment");
+        uint256 dust = unsafeSub(value, config.ethFee);
+        if (dust != 0) {
+            (bool sent,) = address(msg.sender).call{value : dust}("");
+            require(sent, "Failed to return overpayment");
+        }
         _;
     }
 
@@ -75,21 +75,17 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
 
     }
 
-    function release() accountNotFrozen external payable {
+    function release() accountNotFrozen external payable nonReentrant checkEthFeeAndRefundDust(msg.value) {
         uint256 unreleased = releasableAmount(msg.sender);
-        require(unreleased > 0, "No tokens to release");
+        require(unreleased != 0, "No tokens to release");
         require(msg.value >= config.ethFee, "Insufficient fee: the required fee must be covered");
 
-        tokensReleased[msg.sender] = tokensReleased[msg.sender].add(unreleased);
+        tokensReleased[msg.sender] = tokensReleased[msg.sender] + unreleased;
         if (
             !config.token.transfer(msg.sender, unreleased)
         ) {
             revert TransferFailed();
         }
-
-        uint256 dust = msg.value - config.ethFee;
-        (bool sent,) = address(msg.sender).call{value : dust}("");
-        require(sent, "Failed to return overpayment");
 
         emit TokensReleased(unreleased, msg.sender);
     }
@@ -106,67 +102,71 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
         uint256 totalTokens = userTotal[userAddress];
 
         if (block.timestamp > config.endDate) {
-            return totalTokens.sub(tokensReleased[userAddress]);
+            return totalTokens - tokensReleased[userAddress];
         }
 
-        uint256 elapsedTime = block.timestamp.sub(config.startDate);
-        uint256 totalVestingTime = config.endDate.sub(config.startDate);
-        uint256 vestedAmount = totalTokens.mul(elapsedTime).div(totalVestingTime);
-        return vestedAmount.sub(tokensReleased[userAddress]);
+        uint256 elapsedTime = block.timestamp - config.startDate;
+        uint256 totalVestingTime = config.endDate - config.startDate;
+        uint256 vestedAmount = totalTokens * elapsedTime / totalVestingTime;
+        return vestedAmount < tokensReleased[userAddress] ? 0 : vestedAmount - tokensReleased[userAddress];
     }
 
     function withdrawToken(IERC20 token, uint256 amount) external onlyOwner {
 
         if (
-            !token.transfer(owner(), amount)
+            !token.transfer(msg.sender, amount)
         ) {
             revert TransferFailed();
         }
 
-        emit Withdraw(owner(), amount);
+        emit Withdraw(msg.sender, amount);
     }
 
     function withdrawEth(uint256 amount) external onlyOwner {
 
-        (bool success,) = payable(owner()).call{value : amount}("");
+        require(address(this).balance >= amount, "Insufficient balance");
+        (bool success,) = payable(msg.sender).call{value : amount}("");
         if (!success) {
             revert WithdrawFailed();
         }
-        emit WithdrawEth(owner(), amount);
+        emit WithdrawEth(msg.sender, amount);
     }
 
     function updateEthFee(uint256 _newFee) external onlyOwner {
 
+        uint256 oldFee = config.ethFee;
         config.ethFee = _newFee;
-        emit UpdateFee(_newFee);
+        emit UpdateFee(_newFee, oldFee);
     }
 
     function registerVestingAccounts(address[] memory _userAddresses, uint256[] memory _amounts) external onlyOwner {
         require(_amounts.length == _userAddresses.length, "Amounts and userAddresses must have the same length");
 
-        for (uint i = 0; i < _userAddresses.length; i++) {
+        for (uint i; i < _userAddresses.length; i = unsafeInc(i)) {
             userTotal[_userAddresses[i]] = _amounts[i];
         }
     }
 
-    function freezeVestingAccount(address _userAddress, bool _freeze) external onlyOwner {
-        freezeUsers[_userAddress] = _freeze;
-
-        emit FreezeAccount(_userAddress);
+    function freezeVestingAccount(address[] memory _userAddresses, bool _freeze) external onlyOwner {
+        for (uint i; i < _userAddresses.length; i = unsafeInc(i)) {
+            freezeUsers[_userAddresses[i]] = _freeze;
+            emit FreezeAccount(_userAddresses[i], _freeze);
+        }
     }
 
     function setRewardRate(uint256 _rate) external onlyOwner {
+        require(block.timestamp < config.startDate, "Staking after startDate inactive.");
         rewardPeriods.push(RewardPeriod(block.timestamp, _rate));
     }
 
 
     function getStakingRewards(address _userAddress) public view returns (uint256){
-        if (block.timestamp < rewardPeriods[0].start) {
+        if (block.timestamp < rewardPeriods[0].start || freezeUsers[_userAddress]) {
             return 0;
         }
         uint256 userReward;
 
-        for (uint256 i = 0; i < rewardPeriods.length; i++) {
+        for (uint256 i; i < rewardPeriods.length; i = unsafeInc(i)) {
 
             if (i == rewardPeriods.length - 1) {
                 uint256 elapsedTime = block.timestamp < config.startDate ? block.timestamp - rewardPeriods[i].start : config.startDate - rewardPeriods[i].start;
@@ -180,7 +180,7 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
         return userReward;
     }
 
-    function claimStakingRewards() public payable checkEthFeeAndRefundDust(msg.value) nonReentrant accountNotFrozen {
+    function claimStakingRewards() external payable nonReentrant checkEthFeeAndRefundDust(msg.value) accountNotFrozen {
         uint256 claimableRewards = getStakingRewards(msg.sender) - stakingRewardsReleased[msg.sender];
 
         if (claimableRewards == 0) {
@@ -190,5 +190,13 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
         stakingRewardsReleased[msg.sender] += claimableRewards;
         require(config.token.transfer(msg.sender, claimableRewards), "Claim transfer failed.");
         emit StakingRewardClaimed(msg.sender, claimableRewards);
+    }
+
+    function unsafeInc(uint x) private pure returns (uint) {
+    unchecked {return x + 1;}
+    }
+
+    function unsafeSub(uint x, uint y) private pure returns (uint) {
+    unchecked {return x - y;}
     }
 }
