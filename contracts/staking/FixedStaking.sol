@@ -50,8 +50,10 @@ contract FixedStaking is Ownable, ReentrancyGuard {
     modifier checkEthFeeAndRefundDust(uint256 value) {
         require(value >= ethFee, "Insufficient fee: the required fee must be covered");
         uint256 dust = unsafeSub(value, ethFee);
-        (bool sent,) = address(msg.sender).call{value : dust}("");
-        require(sent, "Failed to return overpayment");
+        if (dust != 0) {
+            (bool sent,) = address(msg.sender).call{value : dust}("");
+            require(sent, "Failed to return overpayment");
+        }
         _;
     }
 
@@ -88,7 +90,7 @@ contract FixedStaking is Ownable, ReentrancyGuard {
 
     function startUnstaking(uint256 _amount) external payable nonReentrant checkEthFeeAndRefundDust(msg.value) {
         UserInfo storage user = userInfo[msg.sender];
-        require(_amount > 0, "Zero amount");
+        require(_amount != 0, "Zero amount");
         require(user.unbondings.length < unbondLimit, "startUnstaking: limit reached");
         require(user.amount >= _amount, "startUnstaking: not enough staked amount");
         totalStaked -= _amount;

@@ -75,7 +75,7 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
 
     }
 
-    function release() accountNotFrozen external payable nonReentrant checkEthFeeAndRefundDust(msg.value) {
+    function release() external payable nonReentrant accountNotFrozen checkEthFeeAndRefundDust(msg.value) {
         uint256 unreleased = releasableAmount(msg.sender);
         require(unreleased != 0, "No tokens to release");
         require(msg.value >= config.ethFee, "Insufficient fee: the required fee must be covered");
@@ -147,7 +147,7 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
         }
     }
 
-    function freezeVestingAccount(address[] memory _userAddresses, bool _freeze) external onlyOwner {
+    function freezeVestingAccounts(address[] memory _userAddresses, bool _freeze) external onlyOwner {
         for (uint i; i < _userAddresses.length; i = unsafeInc(i)) {
             freezeUsers[_userAddresses[i]] = _freeze;
             emit FreezeAccount(_userAddresses[i], _freeze);
@@ -180,7 +180,7 @@ contract FixedVestingCliff is Ownable, ReentrancyGuard {
         return userReward;
     }
 
-    function claimStakingRewards() external payable nonReentrant checkEthFeeAndRefundDust(msg.value) accountNotFrozen {
+    function claimStakingRewards() external payable nonReentrant accountNotFrozen checkEthFeeAndRefundDust(msg.value)  {
         uint256 claimableRewards = getStakingRewards(msg.sender) - stakingRewardsReleased[msg.sender];
 
         if (claimableRewards == 0) {
