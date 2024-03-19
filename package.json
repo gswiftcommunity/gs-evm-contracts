@@ -21,7 +21,7 @@
     "hardhat": "^2.12.6",
     "hardhat-contract-sizer": "^2.7.0",
     "hardhat-gas-reporter": "^1.0.9",
-    "merkletreejs": "^0.2.32",
+    "merkletreejs": "^0.3.11",
     "solidity-coverage": "^0.8.2",
     "ts-node": "^10.9.1",
     "typechain": "^8.1.1",
