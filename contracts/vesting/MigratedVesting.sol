@@ -31,7 +31,7 @@ contract MigratedVesting is Ownable {
 
     mapping(address => uint256) internal _initialDistribution;
     mapping(address => uint256) internal _totalReleased;
-    mapping(address => uint256) internal _userTotal;
+    mapping(address => uint256) internal _linearDistribution;
     mapping(address => bool) internal _frozenWallets;
 
     modifier takeFee() {
@@ -69,7 +69,9 @@ contract MigratedVesting is Ownable {
     }
 
     function userTotal(address userAddress) public view returns (uint256) {
-        return _userTotal[userAddress];
+        return
+            _linearDistribution[userAddress] +
+            _initialDistribution[userAddress];
     }
 
     function initialDistribution(address wallet) public view returns (uint256) {
@@ -83,8 +85,7 @@ contract MigratedVesting is Ownable {
             revert NothingToRelease();
         }
 
-        _totalReleased[msg.sender] = _totalReleased[msg.sender] + unreleased;
-
+        _totalReleased[msg.sender] += unreleased;
         token.safeTransfer(msg.sender, unreleased);
 
         emit TokensReleased(unreleased, msg.sender);
@@ -128,13 +129,12 @@ contract MigratedVesting is Ownable {
     function setUserAllocation(
         address[] calldata wallets,
         uint256[] calldata initialAmounts,
-        uint256[] calldata totalVestedAmounts
+        uint256[] calldata unvestedAmounts
     ) external onlyOwner {
         uint256 length = wallets.length;
 
         if (
-            length != initialAmounts.length ||
-            length != totalVestedAmounts.length
+            length != initialAmounts.length || length != unvestedAmounts.length
         ) {
             revert ArraysLengthMismatch();
         }
@@ -142,12 +142,12 @@ contract MigratedVesting is Ownable {
         for (uint256 i = 0; i < length; i++) {
             address wallet = wallets[i];
             uint256 initialAmount = initialAmounts[i];
-            uint256 totalVestedAmount = totalVestedAmounts[i];
+            uint256 unvested = unvestedAmounts[i];
 
             _initialDistribution[wallet] = initialAmount;
-            _userTotal[wallet] = totalVestedAmount;
+            _linearDistribution[wallet] = unvested;
 
-            emit WalletRegistered(wallet, initialAmount, totalVestedAmount);
+            emit WalletRegistered(wallet, initialAmount, unvested);
         }
     }
 
@@ -163,13 +163,10 @@ contract MigratedVesting is Ownable {
             return 0;
         }
 
-        return
-            vestedAmount(wallet) +
-            initialDistribution(wallet) -
-            tokensReleased(wallet);
+        return vestedAmount(wallet) - releasedAmount(wallet);
     }
 
-    function tokensReleased(address wallet) public view returns (uint256) {
+    function releasedAmount(address wallet) public view returns (uint256) {
         return _totalReleased[wallet];
     }
 
@@ -182,15 +179,20 @@ contract MigratedVesting is Ownable {
             return 0;
         }
 
-        uint256 totalTokens = userTotal(wallet);
+        uint256 linearDis = _linearDistribution[wallet];
         uint256 vestedTo = block.timestamp > endDate
             ? endDate
             : block.timestamp;
 
         uint256 elapsedTime = vestedTo - startDate;
         uint256 totalVestingTime = endDate - startDate;
+        uint256 vested = (linearDis * elapsedTime) / totalVestingTime;
 
-        return (totalTokens * elapsedTime) / totalVestingTime;
+        return vested + initialDistribution(wallet);
+    }
+
+    function unvestedAmount(address wallet) public view returns (uint256) {
+        return userTotal(wallet) - vestedAmount(wallet);
     }
 
     function _transferNative(address to, uint256 amount) internal {
