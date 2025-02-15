@@ -3,3 +3,5 @@
 /.idea/
 /typechain-types/
 /node_modules/
+
+.env
